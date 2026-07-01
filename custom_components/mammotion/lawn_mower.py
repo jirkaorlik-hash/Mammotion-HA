@@ -261,6 +261,30 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
             modify_plan = False
             plan_only = False
 
+        # If no areas are selected (either the user did not pass any, or the
+        # zone switches were reset by a restart — OperationSettings is in-memory
+        # only), fall back to the zones the mower itself remembers from its
+        # last mow.  This mirrors the phone app's behaviour: pressing Start
+        # without picking zones uses the last-known set.
+        if not operational_settings.areas:
+            device_work = getattr(self.coordinator.data, "work", None)
+            if device_work is not None and device_work.zone_hashs:
+                fallback_zones = list(dict.fromkeys(device_work.zone_hashs))
+                LOGGER.info(
+                    "[start_mowing] no areas selected — falling back to mower's "
+                    "last-used zones: %s",
+                    fallback_zones,
+                )
+                operational_settings.areas = fallback_zones
+            else:
+                LOGGER.warning(
+                    "[start_mowing] no areas selected AND mower has no stored "
+                    "zones — the mow will likely start and immediately return "
+                    "to dock (nothing to mow). Toggle on the zone switches "
+                    "in HA, or start once from the phone app to populate "
+                    "the mower's stored zones."
+                )
+
         # check if job in progress
         #
         mode = self.rpt_dev_status.sys_status
