@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from copy import copy
 from datetime import time
 from typing import Any, cast
@@ -340,7 +341,9 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
 
                     # If the mower is sitting on the dock (charge_state != 0),
                     # the firmware silently rejects start_job.  The phone app
-                    # sends leave_dock first; we mirror that here.
+                    # sends leave_dock first and waits for the mower to physically
+                    # disconnect before proceeding.  We mirror that here — the
+                    # command ack alone is not enough; charge_state has to reach 0.
                     if charge_state != 0:
                         LOGGER.info(
                             "[start_mowing] mower is docked (charge_state=%s) — "
@@ -348,15 +351,43 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
                             charge_state,
                         )
                         await self.coordinator.async_leave_dock()
-                        # Refresh state; leave_dock takes a few seconds
-                        await self.coordinator.async_request_report_snapshot()
-                        mode = self.rpt_dev_status.sys_status
-                        charge_state = self.rpt_dev_status.charge_state
-                        LOGGER.info(
-                            "[start_mowing] after leave_dock: mode=%s charge_state=%s",
-                            mode,
-                            charge_state,
-                        )
+
+                        # Poll charge_state up to 30 s waiting for the physical
+                        # disconnect.  The report snapshot is asynchronous over
+                        # MQTT, so we request one, sleep briefly, then re-read.
+                        wait_deadline = 30
+                        for attempt in range(wait_deadline):
+                            await asyncio.sleep(1)
+                            await self.coordinator.async_request_report_snapshot()
+                            new_charge_state = self.rpt_dev_status.charge_state
+                            new_mode = self.rpt_dev_status.sys_status
+                            LOGGER.debug(
+                                "[start_mowing] leave_dock poll #%d: mode=%s charge_state=%s",
+                                attempt + 1,
+                                new_mode,
+                                new_charge_state,
+                            )
+                            if new_charge_state == 0:
+                                LOGGER.info(
+                                    "[start_mowing] mower left dock after %d s "
+                                    "(mode=%s charge_state=%s)",
+                                    attempt + 1,
+                                    new_mode,
+                                    new_charge_state,
+                                )
+                                mode = new_mode
+                                charge_state = new_charge_state
+                                break
+                        else:
+                            LOGGER.warning(
+                                "[start_mowing] mower did not leave dock within %d s "
+                                "(charge_state still %s) — continuing anyway, but "
+                                "start_job may be rejected by firmware",
+                                wait_deadline,
+                                self.rpt_dev_status.charge_state,
+                            )
+                            mode = self.rpt_dev_status.sys_status
+                            charge_state = self.rpt_dev_status.charge_state
 
                     if breakpoint_info != 0:
                         LOGGER.info(
@@ -368,16 +399,77 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
                             "query_generate_route_information", "bidire_reqconver_path"
                         )
                         if not plan_only:
+                            LOGGER.info("[start_mowing] sending start_job (fire-and-forget)")
                             await self.coordinator.async_send_command("start_job")
+                            LOGGER.info("[start_mowing] start_job sent")
                         return
                     LOGGER.info(
                         "[start_mowing] branch=plan_route_then_start (mode=%s)", mode
                     )
-                    if await self.coordinator.async_plan_route(operational_settings):
+
+                    # Populate operation_settings from the mower's currently
+                    # stored work data BEFORE planning.  Without this, we send
+                    # generate_route_information with default job_id=0,
+                    # job_version=0, toward=0, etc — the mower accepts the
+                    # command, starts moving, then aborts back to the dock
+                    # ~30-60s later because the parameters don't match its
+                    # stored plans.  This mirrors what async_modify_plan_route
+                    # already does for the modify path.
+                    device_work = getattr(self.coordinator.data, "work", None)
+                    if device_work is not None:
+                        LOGGER.info(
+                            "[start_mowing] populating settings from mower work data: "
+                            "job_id=%s job_version=%s toward=%s toward_mode=%s "
+                            "mowing_laps=%s job_mode=%s",
+                            device_work.job_id,
+                            device_work.job_ver,
+                            device_work.toward,
+                            device_work.toward_mode,
+                            device_work.edge_mode,
+                            device_work.job_mode,
+                        )
+                        # Keep the user's area selection; overwrite everything
+                        # else that has a real value on the mower.
+                        operational_settings.toward = device_work.toward
+                        operational_settings.toward_mode = device_work.toward_mode
+                        operational_settings.toward_included_angle = (
+                            device_work.toward_included_angle
+                        )
+                        operational_settings.mowing_laps = device_work.edge_mode
+                        operational_settings.job_mode = device_work.job_mode
+                        operational_settings.job_id = device_work.job_id
+                        operational_settings.job_version = device_work.job_ver
+                    else:
+                        LOGGER.warning(
+                            "[start_mowing] no work data available on coordinator — "
+                            "planning with defaults (job_id=0, job_version=0). "
+                            "Mower may abort mid-mow if defaults are rejected."
+                        )
+
+                    LOGGER.info(
+                        "[start_mowing] calling async_plan_route with "
+                        "speed=%s blade_height=%s mowing_laps=%s job_mode=%s "
+                        "job_id=%s job_version=%s areas=%s",
+                        operational_settings.speed,
+                        operational_settings.blade_height,
+                        operational_settings.mowing_laps,
+                        operational_settings.job_mode,
+                        operational_settings.job_id,
+                        operational_settings.job_version,
+                        operational_settings.areas,
+                    )
+                    plan_ok = await self.coordinator.async_plan_route(operational_settings)
+                    LOGGER.info("[start_mowing] async_plan_route returned %s", plan_ok)
+                    if plan_ok:
                         if not plan_only:
+                            LOGGER.info(
+                                "[start_mowing] sending start_job and waiting for "
+                                "zone_start_precent_t ack..."
+                            )
                             await self.coordinator.async_send_and_wait(
                                 "start_job", "zone_start_precent_t"
                             )
+                            LOGGER.info("[start_mowing] start_job ack received")
                     else:
                         LOGGER.warning(
                             "[start_mowing] async_plan_route returned False — start_job NOT sent"
