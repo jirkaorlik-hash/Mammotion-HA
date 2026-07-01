@@ -337,6 +337,27 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
                         )
                 if mode in (WorkMode.MODE_READY, WorkMode.MODE_INITIALIZATION):
                     trans_key = "start_failed"
+
+                    # If the mower is sitting on the dock (charge_state != 0),
+                    # the firmware silently rejects start_job.  The phone app
+                    # sends leave_dock first; we mirror that here.
+                    if charge_state != 0:
+                        LOGGER.info(
+                            "[start_mowing] mower is docked (charge_state=%s) — "
+                            "sending leave_dock before start_job",
+                            charge_state,
+                        )
+                        await self.coordinator.async_leave_dock()
+                        # Refresh state; leave_dock takes a few seconds
+                        await self.coordinator.async_request_report_snapshot()
+                        mode = self.rpt_dev_status.sys_status
+                        charge_state = self.rpt_dev_status.charge_state
+                        LOGGER.info(
+                            "[start_mowing] after leave_dock: mode=%s charge_state=%s",
+                            mode,
+                            charge_state,
+                        )
+
                     if breakpoint_info != 0:
                         LOGGER.info(
                             "[start_mowing] branch=start_job_with_existing_route (mode=%s, breakpoint=%s)",
