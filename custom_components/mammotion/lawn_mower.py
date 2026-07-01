@@ -384,7 +384,7 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
 
     async def async_dock(self) -> None:
         """Start docking."""
-        trans_key = "pause_failed"
+        trans_key = "dock_failed"
 
         await self.coordinator.async_start_report_stream()
         charge_state = self.rpt_dev_status.charge_state
@@ -403,45 +403,52 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
                 translation_domain=DOMAIN, translation_key="device_not_ready"
             )
 
-        if charge_state == 0 and mode in (
+        # Already docked/charging — nothing to do.
+        if charge_state != 0:
+            LOGGER.info(
+                "[dock] no-op — charge_state=%s (mower already docked/charging)",
+                charge_state,
+            )
+            return
+
+        # Already on its way to the dock — no-op (do NOT cancel the return!
+        # The upstream code sent cancel_return_to_dock here, which is the
+        # opposite of what a "return to dock" action should do).
+        if mode == WorkMode.MODE_RETURNING:
+            LOGGER.info("[dock] no-op — mower already returning to dock")
+            return
+
+        if mode not in (
             WorkMode.MODE_WORKING,
             WorkMode.MODE_PAUSE,
             WorkMode.MODE_READY,
-            WorkMode.MODE_RETURNING,
         ):
-            try:
-                if mode == WorkMode.MODE_WORKING:
-                    LOGGER.info("[dock] branch=pause_execute_task (mode=WORKING)")
-                    trans_key = "pause_failed"
-                    await self.coordinator.async_send_command("pause_execute_task")
-
-                if mode == WorkMode.MODE_RETURNING:
-                    LOGGER.info("[dock] branch=cancel_return_to_dock (mode=RETURNING)")
-                    trans_key = "dock_cancel_failed"
-                    await self.coordinator.async_send_command("cancel_return_to_dock")
-                else:
-                    LOGGER.info("[dock] branch=return_to_dock (mode=%s)", mode)
-                    trans_key = "dock_failed"
-                    await self.coordinator.async_send_command("return_to_dock")
-            except COMMAND_EXCEPTIONS as exc:
-                LOGGER.error(
-                    "[dock] command failed (trans_key=%s): %s: %s",
-                    trans_key,
-                    type(exc).__name__,
-                    exc,
-                )
-                raise HomeAssistantError(
-                    translation_domain=DOMAIN, translation_key=trans_key
-                ) from exc
-            finally:
-                await self.coordinator.async_request_report_snapshot()
-        else:
             LOGGER.warning(
-                "[dock] no-op — charge_state=%s and mode=%s — not in actionable set. "
-                "(Mower may already be docked/charging — charge_state must be 0 to act.)",
-                charge_state,
+                "[dock] no-op — mode %s is not in (WORKING, PAUSE, READY). "
+                "Command ignored.",
                 mode,
             )
+            return
+
+        # For WORKING / PAUSE / READY: send return_to_dock and let the firmware
+        # handle the state transition.  The upstream code used to send
+        # pause_execute_task first when WORKING, which put the mower into PAUSE
+        # state before the dock command arrived; the firmware then rejected the
+        # dock command, so the mower would pause but never return.
+        try:
+            LOGGER.info("[dock] branch=return_to_dock (mode=%s)", mode)
+            await self.coordinator.async_send_command("return_to_dock")
+        except COMMAND_EXCEPTIONS as exc:
+            LOGGER.error(
+                "[dock] command failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key=trans_key
+            ) from exc
+        finally:
+            await self.coordinator.async_request_report_snapshot()
 
     async def async_pause(self) -> None:
         """Pause mower."""
