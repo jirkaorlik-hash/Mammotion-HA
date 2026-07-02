@@ -229,330 +229,158 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
         return None
 
     async def async_start_mowing(self, **kwargs: Any) -> None:
-        """Start mowing."""
-        trans_key = "pause_failed"
+        """Start mowing all zones.
 
+        Simplified flow: mow every zone the mower knows about (from its map),
+        using the mower's own stored settings. No zone selection or per-mow
+        parameters are needed — configure blade height, speed, laps, etc. in
+        the Mammotion phone app; they are stored on the device and reused here.
+
+        Steps:
+          1. Collect all zone hashes from the mower's map.
+          2. If docked, send leave_dock and wait for physical undock.
+          3. If a paused job exists (breakpoint), resume it.
+          4. Otherwise plan the full route (incl. cover-path fetch) and start.
+        """
         await self.coordinator.async_ensure_fresh_state()
 
-        if kwargs:
-            entity_ids = kwargs.pop("areas", [])
-            attributes = [
-                # TODO this should not need to be cast.
-                int(entity_hash)
-                for entity_id in entity_ids
-                if (entity_hash := get_entity_attribute(self.hass, entity_id, "hash"))
-                is not None
-            ]
-            modify_plan = kwargs.pop("modify", False)
-            plan_only = kwargs.pop("plan_only", False)
+        # ---- Collect ALL zones from the mower's map -------------------------
+        data = self.coordinator.data
+        areas_map = getattr(getattr(data, "map", None), "area", {}) or {}
+        all_zone_hashs = [int(h) for h in areas_map.keys()]
 
-            # Merge onto coordinator's restored settings so UI-configured values
-            # (speed, blade_height, etc.) are preserved when not explicitly provided.
-            operational_settings = copy(self.coordinator.operation_settings)
-            operational_settings.areas = list(dict.fromkeys(attributes))
-            for key, value in kwargs.items():
-                setattr(operational_settings, key, value)
-            if DeviceType.is_yuka(self.coordinator.device_name):
-                operational_settings.blade_height = -10
-            LOGGER.debug(kwargs)
-            LOGGER.debug(operational_settings)
-        else:
-            operational_settings = self.coordinator.operation_settings
-            modify_plan = False
-            plan_only = False
-
-        # If no areas are selected (either the user did not pass any, or the
-        # zone switches were reset by a restart — OperationSettings is in-memory
-        # only), fall back to the zones the mower itself remembers from its
-        # last mow.  This mirrors the phone app's behaviour: pressing Start
-        # without picking zones uses the last-known set.
-        if not operational_settings.areas:
-            device_work = getattr(self.coordinator.data, "work", None)
+        # Fall back to the mower's last-used work zones if the map has none yet.
+        if not all_zone_hashs:
+            device_work = getattr(data, "work", None)
             if device_work is not None and device_work.zone_hashs:
-                fallback_zones = list(dict.fromkeys(device_work.zone_hashs))
-                LOGGER.info(
-                    "[start_mowing] no areas selected — falling back to mower's "
-                    "last-used zones: %s",
-                    fallback_zones,
-                )
-                operational_settings.areas = fallback_zones
-            else:
-                LOGGER.warning(
-                    "[start_mowing] no areas selected AND mower has no stored "
-                    "zones — the mow will likely start and immediately return "
-                    "to dock (nothing to mow). Toggle on the zone switches "
-                    "in HA, or start once from the phone app to populate "
-                    "the mower's stored zones."
-                )
+                all_zone_hashs = list(dict.fromkeys(device_work.zone_hashs))
 
-        # check if job in progress
-        #
+        # Build operational settings from the coordinator's stored settings,
+        # then force the zone list to "all zones".
+        operational_settings = copy(self.coordinator.operation_settings)
+        operational_settings.areas = list(dict.fromkeys(all_zone_hashs))
+        if DeviceType.is_yuka(self.coordinator.device_name):
+            operational_settings.blade_height = -10
+
         mode = self.rpt_dev_status.sys_status
         breakpoint_info = self.report_data.work.bp_info
         charge_state = self.rpt_dev_status.charge_state
 
-        # === Command tracing: capture mower state at command entry =============
         LOGGER.info(
             "[start_mowing] entry — device=%s mode=%s charge_state=%s "
-            "breakpoint_info=%s modify_plan=%s plan_only=%s areas=%s",
+            "breakpoint=%s zones=%s",
             self.coordinator.device_name,
             mode,
             charge_state,
             breakpoint_info,
-            modify_plan,
-            plan_only,
-            getattr(operational_settings, "areas", None),
+            operational_settings.areas,
         )
-        # =======================================================================
 
-        # === Diagnostic: dump the mower's stored plans + work object ===========
-        # This tells us how the mower expects to be started. If there are named
-        # plans, we should start via start_task(plan_id) instead of building an
-        # ad-hoc route.
-        try:
-            data = self.coordinator.data
-            plans = getattr(getattr(data, "map", None), "plan", {}) or {}
-            LOGGER.info(
-                "[start_mowing] DIAG — mower has %d stored plan(s)", len(plans)
+        if mode is None:
+            LOGGER.warning("[start_mowing] aborted — mower mode is None (not ready)")
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key="device_not_ready"
             )
-            for pid, plan in plans.items():
-                LOGGER.info(
-                    "[start_mowing] DIAG plan id=%s task_name=%r job_name=%r "
-                    "zone_hashs=%s area=%s knife_height=%s edge_mode=%s speed=%s",
-                    pid,
-                    getattr(plan, "task_name", None),
-                    getattr(plan, "job_name", None),
-                    getattr(plan, "zone_hashs", None),
-                    getattr(plan, "area", None),
-                    getattr(plan, "knife_height", None),
-                    getattr(plan, "edge_mode", None),
-                    getattr(plan, "speed", None),
-                )
-            work = getattr(data, "work", None)
-            if work is not None:
-                LOGGER.info(
-                    "[start_mowing] DIAG work — zone_hashs=%s job_id=%s job_ver=%s "
-                    "job_mode=%s bp_info=%s path_hash=%s ub_path_hash=%s",
-                    getattr(work, "zone_hashs", None),
-                    getattr(work, "job_id", None),
-                    getattr(work, "job_ver", None),
-                    getattr(work, "job_mode", None),
-                    getattr(work, "bp_info", None),
-                    getattr(work, "path_hash", None),
-                    getattr(work, "ub_path_hash", None),
-                )
-            areas_map = getattr(getattr(data, "map", None), "area", {}) or {}
-            LOGGER.info(
-                "[start_mowing] DIAG — mower map has %d area(s): keys=%s",
-                len(areas_map),
-                list(areas_map.keys()),
+
+        if not operational_settings.areas and breakpoint_info == 0:
+            LOGGER.warning(
+                "[start_mowing] mower map has no zones — nothing to mow. "
+                "Create/define zones in the Mammotion app first."
             )
-        except Exception as diag_exc:  # noqa: BLE001
-            LOGGER.warning("[start_mowing] DIAG dump failed: %s", diag_exc)
-        # =======================================================================
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key="start_failed"
+            )
 
-
-
-        if mode in (
+        if mode not in (
             WorkMode.MODE_PAUSE,
             WorkMode.MODE_READY,
             WorkMode.MODE_RETURNING,
             WorkMode.MODE_WORKING,
             WorkMode.MODE_INITIALIZATION,
         ):
-            try:
-                if modify_plan:
-                    LOGGER.info("[start_mowing] branch=modify_plan")
-                    await self.coordinator.async_modify_plan_route(operational_settings)
-                    return
-
-                if kwargs:
-                    LOGGER.debug("[start_mowing] cancelling current job before start")
-                    await self.async_cancel()
-
-                if mode == WorkMode.MODE_RETURNING:
-                    LOGGER.info(
-                        "[start_mowing] branch=cancel_return_to_dock (mode was RETURNING)"
-                    )
-                    trans_key = "dock_cancel_failed"
-                    await self.coordinator.async_send_and_wait(
-                        "cancel_return_to_dock", "todev_taskctrl_ack"
-                    )
-                    await self.coordinator.async_request_report_snapshot()
-                    mode = self.rpt_dev_status.sys_status
-                    LOGGER.info(
-                        "[start_mowing] mode after cancel_return_to_dock: %s", mode
-                    )
-                if mode == WorkMode.MODE_PAUSE:
-                    trans_key = "resume_failed"
-                    if breakpoint_info != 0:
-                        LOGGER.info(
-                            "[start_mowing] branch=resume_execute_task (PAUSE + breakpoint=%s)",
-                            breakpoint_info,
-                        )
-                        await self.coordinator.async_send_command("resume_execute_task")
-                        await self.coordinator.async_send_and_wait(
-                            "query_generate_route_information", "bidire_reqconver_path"
-                        )
-                    else:
-                        LOGGER.warning(
-                            "[start_mowing] mode=PAUSE but breakpoint_info=0 — "
-                            "no resume sent (this can swallow the start command)"
-                        )
-                if mode in (WorkMode.MODE_READY, WorkMode.MODE_INITIALIZATION):
-                    trans_key = "start_failed"
-
-                    # If the mower is sitting on the dock (charge_state != 0),
-                    # the firmware silently rejects start_job.  The phone app
-                    # sends leave_dock first and waits for the mower to physically
-                    # disconnect before proceeding.  We mirror that here — the
-                    # command ack alone is not enough; charge_state has to reach 0.
-                    if charge_state != 0:
-                        LOGGER.info(
-                            "[start_mowing] mower is docked (charge_state=%s) — "
-                            "sending leave_dock before start_job",
-                            charge_state,
-                        )
-                        await self.coordinator.async_leave_dock()
-
-                        # Poll charge_state up to 30 s waiting for the physical
-                        # disconnect.  The report snapshot is asynchronous over
-                        # MQTT, so we request one, sleep briefly, then re-read.
-                        wait_deadline = 30
-                        for attempt in range(wait_deadline):
-                            await asyncio.sleep(1)
-                            await self.coordinator.async_request_report_snapshot()
-                            new_charge_state = self.rpt_dev_status.charge_state
-                            new_mode = self.rpt_dev_status.sys_status
-                            LOGGER.debug(
-                                "[start_mowing] leave_dock poll #%d: mode=%s charge_state=%s",
-                                attempt + 1,
-                                new_mode,
-                                new_charge_state,
-                            )
-                            if new_charge_state == 0:
-                                LOGGER.info(
-                                    "[start_mowing] mower left dock after %d s "
-                                    "(mode=%s charge_state=%s)",
-                                    attempt + 1,
-                                    new_mode,
-                                    new_charge_state,
-                                )
-                                mode = new_mode
-                                charge_state = new_charge_state
-                                break
-                        else:
-                            LOGGER.warning(
-                                "[start_mowing] mower did not leave dock within %d s "
-                                "(charge_state still %s) — continuing anyway, but "
-                                "start_job may be rejected by firmware",
-                                wait_deadline,
-                                self.rpt_dev_status.charge_state,
-                            )
-                            mode = self.rpt_dev_status.sys_status
-                            charge_state = self.rpt_dev_status.charge_state
-
-                    # Root cause of the "starts then returns to dock after a few
-                    # seconds" bug: async_plan_route only sent
-                    # generate_route_information and then start_job — but it never
-                    # fetched the actual cover-path frames the mower needs to
-                    # follow. The mower ended up with a route *header* but no path
-                    # *data*, so it started, had nothing to follow, and returned
-                    # to the dock.
-                    #
-                    # The pymammotion library's own mow-start flow runs the full
-                    # MowPathSaga (get_all_boundary_hash_list -> generate_route ->
-                    # get_line_info_list -> collect cover_path_upload frames).
-                    # async_plan_route_full runs that complete saga.
-
-                    # Populate operation_settings from the mower's stored work
-                    # data where it has real values (job_mode etc). areas is kept
-                    # as the user's selection.
-                    device_work = getattr(self.coordinator.data, "work", None)
-                    if device_work is not None:
-                        operational_settings.toward = device_work.toward
-                        operational_settings.toward_mode = device_work.toward_mode
-                        operational_settings.toward_included_angle = (
-                            device_work.toward_included_angle
-                        )
-                        operational_settings.mowing_laps = device_work.edge_mode
-                        operational_settings.job_mode = device_work.job_mode
-
-                    if breakpoint_info != 0:
-                        LOGGER.info(
-                            "[start_mowing] branch=resume_existing_route "
-                            "(breakpoint=%s) — querying stored route then starting",
-                            breakpoint_info,
-                        )
-                        await self.coordinator.async_send_and_wait(
-                            "query_generate_route_information", "bidire_reqconver_path"
-                        )
-                        if not plan_only:
-                            await self.coordinator.async_send_command("start_job")
-                            LOGGER.info("[start_mowing] start_job sent (resume)")
-                        return
-
-                    LOGGER.info(
-                        "[start_mowing] branch=plan_route_full_then_start (mode=%s) — "
-                        "speed=%s blade_height=%s mowing_laps=%s job_mode=%s "
-                        "channel_mode=%s channel_width=%s areas=%s",
-                        mode,
-                        operational_settings.speed,
-                        operational_settings.blade_height,
-                        operational_settings.mowing_laps,
-                        operational_settings.job_mode,
-                        operational_settings.channel_mode,
-                        operational_settings.channel_width,
-                        operational_settings.areas,
-                    )
-                    LOGGER.info(
-                        "[start_mowing] running full MowPathSaga "
-                        "(plan + fetch cover path)..."
-                    )
-                    plan_ok = await self.coordinator.async_plan_route_full(
-                        operational_settings
-                    )
-                    LOGGER.info(
-                        "[start_mowing] async_plan_route_full returned %s", plan_ok
-                    )
-                    if plan_ok:
-                        if not plan_only:
-                            LOGGER.info(
-                                "[start_mowing] sending start_job and waiting for "
-                                "zone_start_precent_t ack..."
-                            )
-                            await self.coordinator.async_send_and_wait(
-                                "start_job", "zone_start_precent_t"
-                            )
-                            LOGGER.info("[start_mowing] start_job ack received")
-                    else:
-                        LOGGER.warning(
-                            "[start_mowing] async_plan_route_full returned False — "
-                            "start_job NOT sent"
-                        )
-
-            except COMMAND_EXCEPTIONS as exc:
-                LOGGER.error(
-                    "[start_mowing] command failed (trans_key=%s): %s: %s",
-                    trans_key,
-                    type(exc).__name__,
-                    exc,
-                )
-                raise HomeAssistantError(
-                    translation_domain=DOMAIN, translation_key=trans_key
-                ) from exc
-            finally:
-                await self.coordinator.async_request_report_snapshot()
-        else:
             LOGGER.warning(
-                "[start_mowing] no-op — mower mode %s is not in the actionable set "
-                "(PAUSE, READY, RETURNING, WORKING, INITIALIZATION). "
-                "Command will be silently ignored.",
-                mode,
+                "[start_mowing] no-op — mode %s not in actionable set", mode
             )
+            return
+
+        trans_key = "start_failed"
+        try:
+            # ---- If already returning to dock, cancel that first ------------
+            if mode == WorkMode.MODE_RETURNING:
+                LOGGER.info("[start_mowing] cancelling return-to-dock first")
+                trans_key = "dock_cancel_failed"
+                await self.coordinator.async_send_and_wait(
+                    "cancel_return_to_dock", "todev_taskctrl_ack"
+                )
+                await self.coordinator.async_request_report_snapshot()
+                mode = self.rpt_dev_status.sys_status
+
+            # ---- Resume a paused job ----------------------------------------
+            if mode == WorkMode.MODE_PAUSE and breakpoint_info != 0:
+                LOGGER.info(
+                    "[start_mowing] resuming paused job (breakpoint=%s)",
+                    breakpoint_info,
+                )
+                trans_key = "resume_failed"
+                await self.coordinator.async_send_command("resume_execute_task")
+                await self.coordinator.async_send_and_wait(
+                    "query_generate_route_information", "bidire_reqconver_path"
+                )
+                return
+
+            # ---- Leave the dock if docked -----------------------------------
+            if charge_state != 0:
+                LOGGER.info(
+                    "[start_mowing] docked (charge_state=%s) — leaving dock",
+                    charge_state,
+                )
+                await self.coordinator.async_leave_dock()
+                for attempt in range(30):
+                    await asyncio.sleep(1)
+                    await self.coordinator.async_request_report_snapshot()
+                    if self.rpt_dev_status.charge_state == 0:
+                        LOGGER.info(
+                            "[start_mowing] left dock after %d s", attempt + 1
+                        )
+                        break
+                else:
+                    LOGGER.warning(
+                        "[start_mowing] still docked after 30 s — continuing anyway"
+                    )
+
+            # ---- Plan full route (incl. cover-path fetch) and start ---------
+            trans_key = "start_failed"
+            LOGGER.info(
+                "[start_mowing] planning full route for %d zone(s)...",
+                len(operational_settings.areas),
+            )
+            await self.coordinator.async_plan_route_full(operational_settings)
+            LOGGER.info("[start_mowing] sending start_job...")
+            await self.coordinator.async_send_and_wait(
+                "start_job", "zone_start_precent_t"
+            )
+            LOGGER.info("[start_mowing] start_job ack received — mowing started")
+
+        except COMMAND_EXCEPTIONS as exc:
+            LOGGER.error(
+                "[start_mowing] command failed (%s): %s: %s",
+                trans_key,
+                type(exc).__name__,
+                exc,
+            )
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key=trans_key
+            ) from exc
+        finally:
+            await self.coordinator.async_request_report_snapshot()
 
     async def async_dock(self) -> None:
-        """Start docking."""
+        """Terminate the current task and return to the dock.
+
+        Simplified behaviour: this cancels the running job (not a pause) and
+        sends the mower home. Because the job is cancelled rather than paused,
+        the next Start begins a fresh mow from 0% rather than resuming.
+        """
         trans_key = "dock_failed"
 
         await self.coordinator.async_start_report_stream()
@@ -580,36 +408,29 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
             )
             return
 
-        # Already on its way to the dock — no-op (do NOT cancel the return!
-        # The upstream code sent cancel_return_to_dock here, which is the
-        # opposite of what a "return to dock" action should do).
+        # Already returning — leave it be.
         if mode == WorkMode.MODE_RETURNING:
             LOGGER.info("[dock] no-op — mower already returning to dock")
             return
 
-        if mode not in (
-            WorkMode.MODE_WORKING,
-            WorkMode.MODE_PAUSE,
-            WorkMode.MODE_READY,
-        ):
-            LOGGER.warning(
-                "[dock] no-op — mode %s is not in (WORKING, PAUSE, READY). "
-                "Command ignored.",
-                mode,
-            )
-            return
-
-        # For WORKING / PAUSE / READY: send return_to_dock and let the firmware
-        # handle the state transition.  The upstream code used to send
-        # pause_execute_task first when WORKING, which put the mower into PAUSE
-        # state before the dock command arrived; the firmware then rejected the
-        # dock command, so the mower would pause but never return.
         try:
-            LOGGER.info("[dock] branch=return_to_dock (mode=%s)", mode)
+            # Cancel (terminate) any active/paused job so the next Start begins
+            # from 0%.  cancel_job = NavTaskCtrl action 4 (end job), not a pause.
+            if mode in (WorkMode.MODE_WORKING, WorkMode.MODE_PAUSE):
+                LOGGER.info("[dock] cancelling current job (mode=%s)", mode)
+                trans_key = "dock_cancel_failed"
+                await self.coordinator.async_send_and_wait(
+                    "cancel_job", "todev_taskctrl_ack"
+                )
+                await self.coordinator.async_request_report_snapshot()
+
+            LOGGER.info("[dock] sending return_to_dock")
+            trans_key = "dock_failed"
             await self.coordinator.async_send_command("return_to_dock")
         except COMMAND_EXCEPTIONS as exc:
             LOGGER.error(
-                "[dock] command failed: %s: %s",
+                "[dock] command failed (%s): %s: %s",
+                trans_key,
                 type(exc).__name__,
                 exc,
             )

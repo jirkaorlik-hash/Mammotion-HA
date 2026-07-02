@@ -94,9 +94,13 @@ PLATFORMS: list[Platform] = [
     Platform.DEVICE_TRACKER,
     Platform.SENSOR,
     Platform.BUTTON,
-    Platform.SWITCH,
-    Platform.NUMBER,
-    Platform.SELECT,
+    # Settings platforms disabled — all mow settings (speed, blade height,
+    # laps, zone selection, etc.) are configured in the Mammotion phone app.
+    # HA control is limited to Start (mow all zones) and Dock (terminate +
+    # return). Re-enable any of these by uncommenting.
+    # Platform.SWITCH,
+    # Platform.NUMBER,
+    # Platform.SELECT,
     # Platform.CAMERA disabled — Agora WebRTC streaming not used.
     # Re-enable by uncommenting if you want the live camera feed back.
     Platform.UPDATE,
