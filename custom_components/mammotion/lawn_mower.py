@@ -305,14 +305,53 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
         )
         # =======================================================================
 
-        if mode is None:
-            LOGGER.warning(
-                "[start_mowing] aborted — mower mode is None (device not ready). "
-                "Device may be offline or first state update has not yet arrived."
+        # === Diagnostic: dump the mower's stored plans + work object ===========
+        # This tells us how the mower expects to be started. If there are named
+        # plans, we should start via start_task(plan_id) instead of building an
+        # ad-hoc route.
+        try:
+            data = self.coordinator.data
+            plans = getattr(getattr(data, "map", None), "plan", {}) or {}
+            LOGGER.info(
+                "[start_mowing] DIAG — mower has %d stored plan(s)", len(plans)
             )
-            raise HomeAssistantError(
-                translation_domain=DOMAIN, translation_key="device_not_ready"
+            for pid, plan in plans.items():
+                LOGGER.info(
+                    "[start_mowing] DIAG plan id=%s task_name=%r job_name=%r "
+                    "zone_hashs=%s area=%s knife_height=%s edge_mode=%s speed=%s",
+                    pid,
+                    getattr(plan, "task_name", None),
+                    getattr(plan, "job_name", None),
+                    getattr(plan, "zone_hashs", None),
+                    getattr(plan, "area", None),
+                    getattr(plan, "knife_height", None),
+                    getattr(plan, "edge_mode", None),
+                    getattr(plan, "speed", None),
+                )
+            work = getattr(data, "work", None)
+            if work is not None:
+                LOGGER.info(
+                    "[start_mowing] DIAG work — zone_hashs=%s job_id=%s job_ver=%s "
+                    "job_mode=%s bp_info=%s path_hash=%s ub_path_hash=%s",
+                    getattr(work, "zone_hashs", None),
+                    getattr(work, "job_id", None),
+                    getattr(work, "job_ver", None),
+                    getattr(work, "job_mode", None),
+                    getattr(work, "bp_info", None),
+                    getattr(work, "path_hash", None),
+                    getattr(work, "ub_path_hash", None),
+                )
+            areas_map = getattr(getattr(data, "map", None), "area", {}) or {}
+            LOGGER.info(
+                "[start_mowing] DIAG — mower map has %d area(s): keys=%s",
+                len(areas_map),
+                list(areas_map.keys()),
             )
+        except Exception as diag_exc:  # noqa: BLE001
+            LOGGER.warning("[start_mowing] DIAG dump failed: %s", diag_exc)
+        # =======================================================================
+
+
 
         if mode in (
             WorkMode.MODE_PAUSE,
