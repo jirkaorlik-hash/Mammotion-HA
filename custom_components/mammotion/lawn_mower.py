@@ -350,6 +350,24 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
 
             # ---- Plan full route (incl. cover-path fetch) and start ---------
             trans_key = "start_failed"
+
+            def _log_vio(tag: str) -> None:
+                """Log the vision-inertial odometry signal state."""
+                vi = getattr(self.report_data, "vision_info", None)
+                if vi is None:
+                    LOGGER.info("[start_mowing] VIO %s: no vision_info", tag)
+                    return
+                LOGGER.info(
+                    "[start_mowing] VIO %s: vio_state=%s brightness=%s "
+                    "detect_features=%s track_features=%s",
+                    tag,
+                    getattr(vi, "vio_state", None),
+                    getattr(vi, "brightness", None),
+                    getattr(vi, "detect_feature_num", None),
+                    getattr(vi, "track_feature_num", None),
+                )
+
+            _log_vio("before-plan")
             LOGGER.info(
                 "[start_mowing] planning full route for %d zone(s)...",
                 len(operational_settings.areas),
@@ -360,6 +378,30 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
                 "start_job", "zone_start_precent_t"
             )
             LOGGER.info("[start_mowing] start_job ack received — mowing started")
+
+            # Monitor vision signal + mode for 30s after start. If the mower is
+            # vision-based (Yuka) and VIO never reaches SIGNAL_GOOD (2), it will
+            # abort back to the dock — this loop captures exactly that.
+            for i in range(30):
+                await asyncio.sleep(2)
+                await self.coordinator.async_request_report_snapshot()
+                cur_mode = self.rpt_dev_status.sys_status
+                _log_vio(f"post-start+{(i + 1) * 2}s mode={cur_mode}")
+                if cur_mode == WorkMode.MODE_RETURNING:
+                    LOGGER.warning(
+                        "[start_mowing] mower entered RETURNING %ds after start — "
+                        "aborted the job. See VIO values above: if vio_state never "
+                        "reached 2 (SIGNAL_GOOD), the vision system could not "
+                        "localise and the mower gave up.",
+                        (i + 1) * 2,
+                    )
+                    break
+                if cur_mode not in (
+                    WorkMode.MODE_WORKING,
+                    WorkMode.MODE_INITIALIZATION,
+                    WorkMode.MODE_READY,
+                ):
+                    break
 
         except COMMAND_EXCEPTIONS as exc:
             LOGGER.error(
