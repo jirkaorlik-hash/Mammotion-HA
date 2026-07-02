@@ -452,77 +452,24 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
                             mode = self.rpt_dev_status.sys_status
                             charge_state = self.rpt_dev_status.charge_state
 
-                    # Decide whether to REUSE the mower's stored route or
-                    # OVERWRITE it with a freshly-planned one.
+                    # Root cause of the "starts then returns to dock after a few
+                    # seconds" bug: async_plan_route only sent
+                    # generate_route_information and then start_job — but it never
+                    # fetched the actual cover-path frames the mower needs to
+                    # follow. The mower ended up with a route *header* but no path
+                    # *data*, so it started, had nothing to follow, and returned
+                    # to the dock.
                     #
-                    # Root cause of the "start then return-to-dock after 20-40s"
-                    # bug: async_plan_route sends generate_route_information
-                    # which OVERWRITES the mower's stored plan with our default
-                    # OperationSettings values (job_id=0, job_version=0, etc).
-                    # The mower accepts the new plan, starts, then aborts
-                    # because the parameters don't match anything it knows.
-                    #
-                    # If the mower already has stored zones (work.zone_hashs
-                    # populated — which is the case once you've mowed via the
-                    # phone app), use the same "query + start" path the
-                    # breakpoint-resume branch uses. This READS the mower's
-                    # existing route rather than writing a new one, matching
-                    # what the phone app does when you press Start.
+                    # The pymammotion library's own mow-start flow runs the full
+                    # MowPathSaga (get_all_boundary_hash_list -> generate_route ->
+                    # get_line_info_list -> collect cover_path_upload frames).
+                    # async_plan_route_full runs that complete saga.
+
+                    # Populate operation_settings from the mower's stored work
+                    # data where it has real values (job_mode etc). areas is kept
+                    # as the user's selection.
                     device_work = getattr(self.coordinator.data, "work", None)
-                    has_stored_route = (
-                        device_work is not None
-                        and bool(device_work.zone_hashs)
-                    )
-
-                    if breakpoint_info != 0 or has_stored_route:
-                        LOGGER.info(
-                            "[start_mowing] branch=start_job_with_existing_route "
-                            "(mode=%s, breakpoint=%s, stored_zones=%s) — "
-                            "reusing mower's own stored route",
-                            mode,
-                            breakpoint_info,
-                            len(device_work.zone_hashs) if device_work else 0,
-                        )
-                        # Read (don't write) the mower's current route
-                        await self.coordinator.async_send_and_wait(
-                            "query_generate_route_information", "bidire_reqconver_path"
-                        )
-                        if not plan_only:
-                            LOGGER.info(
-                                "[start_mowing] sending start_job (using existing route)"
-                            )
-                            await self.coordinator.async_send_command("start_job")
-                            LOGGER.info("[start_mowing] start_job sent")
-                        return
-
-                    LOGGER.info(
-                        "[start_mowing] branch=plan_route_then_start "
-                        "(mode=%s) — mower has no stored route, planning a new one",
-                        mode,
-                    )
-
-                    # Populate operation_settings from the mower's currently
-                    # stored work data BEFORE planning.  Without this, we send
-                    # generate_route_information with default job_id=0,
-                    # job_version=0, toward=0, etc — the mower accepts the
-                    # command, starts moving, then aborts back to the dock
-                    # ~30-60s later because the parameters don't match its
-                    # stored plans.  This mirrors what async_modify_plan_route
-                    # already does for the modify path.
                     if device_work is not None:
-                        LOGGER.info(
-                            "[start_mowing] populating settings from mower work data: "
-                            "job_id=%s job_version=%s toward=%s toward_mode=%s "
-                            "mowing_laps=%s job_mode=%s",
-                            device_work.job_id,
-                            device_work.job_ver,
-                            device_work.toward,
-                            device_work.toward_mode,
-                            device_work.edge_mode,
-                            device_work.job_mode,
-                        )
-                        # Keep the user's area selection; overwrite everything
-                        # else that has a real value on the mower.
                         operational_settings.toward = device_work.toward
                         operational_settings.toward_mode = device_work.toward_mode
                         operational_settings.toward_included_angle = (
@@ -530,29 +477,44 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
                         )
                         operational_settings.mowing_laps = device_work.edge_mode
                         operational_settings.job_mode = device_work.job_mode
-                        operational_settings.job_id = device_work.job_id
-                        operational_settings.job_version = device_work.job_ver
-                    else:
-                        LOGGER.warning(
-                            "[start_mowing] no work data available on coordinator — "
-                            "planning with defaults (job_id=0, job_version=0). "
-                            "Mower may abort mid-mow if defaults are rejected."
+
+                    if breakpoint_info != 0:
+                        LOGGER.info(
+                            "[start_mowing] branch=resume_existing_route "
+                            "(breakpoint=%s) — querying stored route then starting",
+                            breakpoint_info,
                         )
+                        await self.coordinator.async_send_and_wait(
+                            "query_generate_route_information", "bidire_reqconver_path"
+                        )
+                        if not plan_only:
+                            await self.coordinator.async_send_command("start_job")
+                            LOGGER.info("[start_mowing] start_job sent (resume)")
+                        return
 
                     LOGGER.info(
-                        "[start_mowing] calling async_plan_route with "
+                        "[start_mowing] branch=plan_route_full_then_start (mode=%s) — "
                         "speed=%s blade_height=%s mowing_laps=%s job_mode=%s "
-                        "job_id=%s job_version=%s areas=%s",
+                        "channel_mode=%s channel_width=%s areas=%s",
+                        mode,
                         operational_settings.speed,
                         operational_settings.blade_height,
                         operational_settings.mowing_laps,
                         operational_settings.job_mode,
-                        operational_settings.job_id,
-                        operational_settings.job_version,
+                        operational_settings.channel_mode,
+                        operational_settings.channel_width,
                         operational_settings.areas,
                     )
-                    plan_ok = await self.coordinator.async_plan_route(operational_settings)
-                    LOGGER.info("[start_mowing] async_plan_route returned %s", plan_ok)
+                    LOGGER.info(
+                        "[start_mowing] running full MowPathSaga "
+                        "(plan + fetch cover path)..."
+                    )
+                    plan_ok = await self.coordinator.async_plan_route_full(
+                        operational_settings
+                    )
+                    LOGGER.info(
+                        "[start_mowing] async_plan_route_full returned %s", plan_ok
+                    )
                     if plan_ok:
                         if not plan_only:
                             LOGGER.info(
@@ -565,7 +527,8 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
                             LOGGER.info("[start_mowing] start_job ack received")
                     else:
                         LOGGER.warning(
-                            "[start_mowing] async_plan_route returned False — start_job NOT sent"
+                            "[start_mowing] async_plan_route_full returned False — "
+                            "start_job NOT sent"
                         )
 
             except COMMAND_EXCEPTIONS as exc:

@@ -100,7 +100,7 @@ if TYPE_CHECKING:
 
 MAINTENANCE_INTERVAL = timedelta(minutes=60)
 DEFAULT_INTERVAL = timedelta(minutes=30)
-REPORT_INTERVAL = timedelta(minutes=10)  # increased from 5 min — halves baseline MQTT send rate
+REPORT_INTERVAL = timedelta(minutes=7)  # 5→7 min — reduces send rate while staying ahead of the 10-min push-subscription silence window
 DYNAMICS_LINE_INTERVAL = timedelta(seconds=10)
 DEVICE_VERSION_INTERVAL = timedelta(weeks=1)
 MAP_INTERVAL = timedelta(minutes=60)
@@ -1140,6 +1140,32 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             route_info=route_information,
             skip_planning=True,
         )
+
+    async def async_plan_route_full(
+        self, operation_settings: OperationSettings
+    ) -> bool:
+        """Plan a mow route AND collect the cover-path frames from the device.
+
+        Unlike async_plan_route (which only sends generate_route_information and
+        returns immediately), this runs the complete MowPathSaga with
+        skip_planning=False.  The saga:
+          1. fetches the boundary hash list,
+          2. sends generate_route_information,
+          3. fetches the line info list, and
+          4. downloads all cover_path_upload frames.
+
+        Without steps 3-4 the mower has a route header but no actual path data,
+        so start_job causes it to start briefly and then return to the dock.
+        This mirrors the pymammotion library's own full mow-start flow.
+        """
+        route_information = self.generate_route_information(operation_settings)
+        await self.manager.start_mow_path_saga(
+            self.device_name,
+            zone_hashs=list(operation_settings.areas),
+            route_info=route_information,
+            skip_planning=False,
+        )
+        return True
 
     async def async_modify_plan_route(
         self, operation_settings: OperationSettings
