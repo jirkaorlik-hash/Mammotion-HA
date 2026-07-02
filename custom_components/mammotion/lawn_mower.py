@@ -413,22 +413,53 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
                             mode = self.rpt_dev_status.sys_status
                             charge_state = self.rpt_dev_status.charge_state
 
-                    if breakpoint_info != 0:
+                    # Decide whether to REUSE the mower's stored route or
+                    # OVERWRITE it with a freshly-planned one.
+                    #
+                    # Root cause of the "start then return-to-dock after 20-40s"
+                    # bug: async_plan_route sends generate_route_information
+                    # which OVERWRITES the mower's stored plan with our default
+                    # OperationSettings values (job_id=0, job_version=0, etc).
+                    # The mower accepts the new plan, starts, then aborts
+                    # because the parameters don't match anything it knows.
+                    #
+                    # If the mower already has stored zones (work.zone_hashs
+                    # populated — which is the case once you've mowed via the
+                    # phone app), use the same "query + start" path the
+                    # breakpoint-resume branch uses. This READS the mower's
+                    # existing route rather than writing a new one, matching
+                    # what the phone app does when you press Start.
+                    device_work = getattr(self.coordinator.data, "work", None)
+                    has_stored_route = (
+                        device_work is not None
+                        and bool(device_work.zone_hashs)
+                    )
+
+                    if breakpoint_info != 0 or has_stored_route:
                         LOGGER.info(
-                            "[start_mowing] branch=start_job_with_existing_route (mode=%s, breakpoint=%s)",
+                            "[start_mowing] branch=start_job_with_existing_route "
+                            "(mode=%s, breakpoint=%s, stored_zones=%s) — "
+                            "reusing mower's own stored route",
                             mode,
                             breakpoint_info,
+                            len(device_work.zone_hashs) if device_work else 0,
                         )
+                        # Read (don't write) the mower's current route
                         await self.coordinator.async_send_and_wait(
                             "query_generate_route_information", "bidire_reqconver_path"
                         )
                         if not plan_only:
-                            LOGGER.info("[start_mowing] sending start_job (fire-and-forget)")
+                            LOGGER.info(
+                                "[start_mowing] sending start_job (using existing route)"
+                            )
                             await self.coordinator.async_send_command("start_job")
                             LOGGER.info("[start_mowing] start_job sent")
                         return
+
                     LOGGER.info(
-                        "[start_mowing] branch=plan_route_then_start (mode=%s)", mode
+                        "[start_mowing] branch=plan_route_then_start "
+                        "(mode=%s) — mower has no stored route, planning a new one",
+                        mode,
                     )
 
                     # Populate operation_settings from the mower's currently
@@ -439,7 +470,6 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
                     # ~30-60s later because the parameters don't match its
                     # stored plans.  This mirrors what async_modify_plan_route
                     # already does for the modify path.
-                    device_work = getattr(self.coordinator.data, "work", None)
                     if device_work is not None:
                         LOGGER.info(
                             "[start_mowing] populating settings from mower work data: "
