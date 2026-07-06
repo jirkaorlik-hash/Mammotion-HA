@@ -10,7 +10,7 @@ import json
 import secrets
 import time
 from abc import abstractmethod
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, cast
 
@@ -73,6 +73,7 @@ from pymammotion.transport.base import (
     ReLoginRequiredError,
     SessionExpiredError,
     Subscription,
+    TransportRateLimitedError,
     TransportType,
 )
 from pymammotion.transport.ble import BLETransport
@@ -106,6 +107,10 @@ DEVICE_VERSION_INTERVAL = timedelta(weeks=1)
 MAP_INTERVAL = timedelta(minutes=60)
 RTK_INTERVAL = timedelta(hours=5)
 SPINO_INTERVAL = timedelta(weeks=1)
+# Renew the continuous count=0 report stream just inside the device's 5-minute
+# stream window so mowing telemetry stays live for ~1 counted MQTT send per
+# window instead of one send per sys_status transition (cloud send quota: 600/12h).
+REPORT_STREAM_RENEW_INTERVAL = timedelta(seconds=270)
 
 # Possible states for ``MammotionReportUpdateCoordinator.map_sync_status`` and
 # the ``map_sync_status`` diagnostic ENUM sensor that surfaces it.
@@ -169,6 +174,10 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         self.map_offset_lon: float = 0.0
         self._bluetooth_enabled: bool = True
         self._cloud_enabled: bool = True
+        #: Monotonic timestamps of the last time a given rate-limited action fired,
+        #: keyed by an arbitrary label. Used by _should_fire() to throttle
+        #: transition-driven counted MQTT sends (cloud send quota is 600/12h).
+        self._fire_times: dict[str, float] = {}
 
         mower_device = self.manager.get_device_by_name(self.device_name)
 
@@ -321,6 +330,21 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             else:
                 await handle.stop_polling()
 
+    def _should_fire(self, key: str, min_interval: float) -> bool:
+        """Return True at most once per *min_interval* seconds for *key*.
+
+        Debounces transition-driven counted MQTT sends so a rapidly oscillating
+        sys_status (normal during autonomous mowing) can't exhaust the device's
+        self-imposed 600-send / 12 h cloud quota. Records the fire time only when
+        it returns True.
+        """
+        now = time.monotonic()
+        last = self._fire_times.get(key, 0.0)
+        if now - last < min_interval:
+            return False
+        self._fire_times[key] = now
+        return True
+
     def is_online(self) -> bool:
         """Return True if the device currently has an active transport connection."""
         device = self.manager.get_device_by_name(self.device_name)
@@ -467,6 +491,21 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             ) from exc
         except NoTransportAvailableError as exc:
             LOGGER.debug(f"No Transport: {exc}")
+        except TransportRateLimitedError as exc:
+            # The MQTT transport self-imposes a 600-send / 12 h cloud quota
+            # (pymammotion). Once tripped, every cloud send is blocked until the
+            # rolling window slides back under the limit. Degrade to offline
+            # quietly instead of raising an unhandled exception out of the
+            # coordinator update / setup batch. Do NOT refresh login — this is a
+            # send quota, not an auth failure, and re-login would not help.
+            self.device_offline(device)
+            LOGGER.warning(
+                "%s: cloud send quota reached (600/12h) — commands blocked until "
+                "the rolling window clears. Connect Bluetooth to avoid the cloud "
+                "quota. (%s)",
+                self.device_name,
+                exc,
+            )
         except (
             GatewayTimeoutException,
             CommandTimeoutError,
@@ -537,6 +576,15 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="api_limit_exceeded"
             ) from exc
+        except TransportRateLimitedError as exc:
+            # Self-imposed 600-send / 12 h cloud quota (pymammotion). Surface as a
+            # rate-limit error rather than a raw library exception. NB: on the
+            # current pymammotion this path enqueues onto a background worker, so
+            # the error is usually logged there and this branch is a safety net.
+            self.device_offline(device)
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key="api_limit_exceeded"
+            ) from exc
         except NoTransportAvailableError as exc:
             LOGGER.debug(
                 "No transport connected yet for %s, command '%s' skipped",
@@ -587,6 +635,15 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             self.device_offline(device)
             return False
         except TooManyRequestsException as exc:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key="api_limit_exceeded"
+            ) from exc
+        except TransportRateLimitedError as exc:
+            # Self-imposed 600-send / 12 h cloud quota (pymammotion). send_raw()
+            # is called directly here (no queue), so this error DOES reach us.
+            # Degrade to offline and surface a rate-limit error, not a raw
+            # library exception; re-login would not help a send quota.
+            self.device_offline(device)
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="api_limit_exceeded"
             ) from exc
@@ -1525,6 +1582,8 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         )
 
         self._on_stop: list[CALLBACK_TYPE] = []
+        #: Cancel callback for the active-mode report-stream renewal timer.
+        self._report_stream_cancel: CALLBACK_TYPE | None = None
 
         self.poll_debouncer = Debouncer(
             hass,
@@ -1603,6 +1662,7 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
     @callback
     def _async_stop(self) -> None:
         """Stop the callbacks."""
+        self._stop_report_stream()
         for unsub in self._on_stop:
             unsub()
         self._on_stop.clear()
@@ -1748,12 +1808,65 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
             )
 
     async def _on_sys_status_changed_refresh(self, sys_status: int) -> None:
-        """Trigger a one-shot count=1 poll on sys_status transitions when not streaming."""
+        """Keep state fresh across sys_status transitions without per-transition polling.
+
+        Cloud-only mowers pay a counted MQTT send for every poll, and the device
+        self-throttles at 600 sends / 12 h. Firing a one-shot snapshot on every
+        sys_status transition burns that budget fast during a mow, because
+        sys_status oscillates continuously. Instead, while the device is in an
+        active (mowing/returning) mode we hold a single continuous count=0 report
+        stream, renewed on a timer just inside the device's 5-minute window
+        (~1 counted send per window). The device then pushes fresh state every few
+        seconds for free, and individual transitions within active mode send
+        nothing. On leaving active mode we tear the stream down and take one
+        debounced snapshot to capture the settled state.
+        """
+        if sys_status in MOWING_ACTIVE_MODES:
+            if self._report_stream_cancel is None:
+                self._report_stream_cancel = async_track_time_interval(
+                    self.hass,
+                    self._renew_report_stream,
+                    REPORT_STREAM_RENEW_INTERVAL,
+                )
+                await self._safe_report_stream_call(self.async_start_report_stream())
+            return
+
+        # Left active mode — stop renewing and take one settled snapshot (debounced
+        # so a flap out-and-back-in near the boundary can't spam the quota).
+        self._stop_report_stream()
+        if self._should_fire("report_settled_snapshot", 120.0):
+            await self._safe_report_stream_call(self.async_request_report_snapshot())
+
+    def _stop_report_stream(self) -> None:
+        """Cancel the active-mode report-stream renewal timer, if running."""
+        if self._report_stream_cancel is not None:
+            self._report_stream_cancel()
+            self._report_stream_cancel = None
+
+    async def _renew_report_stream(self, _now: datetime.datetime) -> None:
+        """Renew the continuous report stream while the device stays active."""
+        device = self.manager.get_device_by_name(self.device_name)
+        sys_status = (
+            device.report_data.dev.sys_status if device is not None else None
+        )
+        if sys_status not in MOWING_ACTIVE_MODES:
+            self._stop_report_stream()
+            return
+        await self._safe_report_stream_call(self.async_start_report_stream())
+
+    async def _safe_report_stream_call(self, coro: Awaitable[None]) -> None:
+        """Await a report-stream/snapshot coroutine, swallowing transient errors."""
         try:
-            await self.async_request_report_snapshot()
-        except (DeviceOfflineException, NoTransportAvailableError):
+            await coro
+        except (
+            DeviceOfflineException,
+            NoTransportAvailableError,
+            GatewayTimeoutException,
+            CommandTimeoutError,
+            TransportRateLimitedError,
+        ):
             LOGGER.debug(
-                "report-coordinator [%s]: skipping sys_status refresh — device offline / no transport",
+                "report-coordinator [%s]: report-stream call skipped (transient)",
                 self.device_name,
             )
 
@@ -2251,6 +2364,11 @@ class MammotionDeviceErrorUpdateCoordinator(
             WorkMode.MODE_LOCK,
             WorkMode.MODE_PAUSE,
         ):
+            # These reads cost two counted MQTT sends. During a mow the device
+            # cycles through these states repeatedly, so debounce to at most once
+            # per 10 min to protect the 600-send / 12 h cloud quota.
+            if not self._should_fire("error_readwrite", 600.0):
+                return
             await self.async_send_and_wait(
                 "read_write_device", "bidire_comm_cmd", rw_id=5, rw=1, context=2
             )
