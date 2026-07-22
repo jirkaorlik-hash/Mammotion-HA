@@ -111,6 +111,14 @@ SPINO_INTERVAL = timedelta(weeks=1)
 # stream window so mowing telemetry stays live for ~1 counted MQTT send per
 # window instead of one send per sys_status transition (cloud send quota: 600/12h).
 REPORT_STREAM_RENEW_INTERVAL = timedelta(seconds=270)
+#: How often to log the current MQTT cloud send count (diagnostic — watch this
+#: climb to find what is burning the 600-send / 12 h quota). Set to INFO so it
+#: shows without enabling debug logging.
+REPORT_QUOTA_LOG_INTERVAL = timedelta(minutes=5)
+#: Minimum spacing between the DeviceError coordinator's diagnostic
+#: read_write_device reads (2 counted sends each). Raised well above the mow
+#: state-cycle period so it costs ~4 sends/h during a mow instead of ~12.
+ERROR_READWRITE_MIN_INTERVAL = 1800.0
 
 # Possible states for ``MammotionReportUpdateCoordinator.map_sync_status`` and
 # the ``map_sync_status`` diagnostic ENUM sensor that surfaces it.
@@ -1584,6 +1592,8 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         self._on_stop: list[CALLBACK_TYPE] = []
         #: Cancel callback for the active-mode report-stream renewal timer.
         self._report_stream_cancel: CALLBACK_TYPE | None = None
+        #: Cancel callback for the diagnostic MQTT send-quota logger.
+        self._quota_log_cancel: CALLBACK_TYPE | None = None
 
         self.poll_debouncer = Debouncer(
             hass,
@@ -1663,6 +1673,9 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
     def _async_stop(self) -> None:
         """Stop the callbacks."""
         self._stop_report_stream()
+        if self._quota_log_cancel is not None:
+            self._quota_log_cancel()
+            self._quota_log_cancel = None
         for unsub in self._on_stop:
             unsub()
         self._on_stop.clear()
@@ -1746,8 +1759,40 @@ class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevi
         if device := self.manager.get_device_by_name(self.device_name):
             self.async_set_updated_data(device)
 
+    @callback
+    def _log_send_quota(self, _now: datetime.datetime) -> None:
+        """Log the current MQTT cloud send count against the 600/12h quota.
+
+        Diagnostic only. Watch this line climb: if it spikes during a mow the
+        telemetry stream is the cost; if it climbs while docked/idle the burn is
+        commands, reloads, or fallback polls. To see *which* frames are being
+        sent, also enable ``pymammotion.device.handle: debug`` and grep for
+        ``sending via CLOUD``.
+        """
+        handle = self.manager.mower(self.device_name)
+        if handle is None:
+            return
+        tt = handle.cloud_transport()
+        if tt is None:
+            return
+        transport = handle.get_transport(tt)
+        if transport is None or not hasattr(transport, "sends_in_window"):
+            return
+        LOGGER.info(
+            "MQTT send quota [%s]: %d / 600 in rolling 12h",
+            self.device_name,
+            transport.sends_in_window(),
+        )
+
     async def _async_setup(self) -> None:
         await super()._async_setup()
+
+        # Diagnostic: log the cloud send count every few minutes so the quota
+        # burn is visible over time. Cheap (one log line, no send).
+        if self._quota_log_cancel is None:
+            self._quota_log_cancel = async_track_time_interval(
+                self.hass, self._log_send_quota, REPORT_QUOTA_LOG_INTERVAL
+            )
 
         # Common commands for all device types
         commands = [
@@ -2365,9 +2410,9 @@ class MammotionDeviceErrorUpdateCoordinator(
             WorkMode.MODE_PAUSE,
         ):
             # These reads cost two counted MQTT sends. During a mow the device
-            # cycles through these states repeatedly, so debounce to at most once
-            # per 10 min to protect the 600-send / 12 h cloud quota.
-            if not self._should_fire("error_readwrite", 600.0):
+            # cycles through these states repeatedly, so debounce (protects the
+            # 600-send / 12 h cloud quota).
+            if not self._should_fire("error_readwrite", ERROR_READWRITE_MIN_INTERVAL):
                 return
             await self.async_send_and_wait(
                 "read_write_device", "bidire_comm_cmd", rw_id=5, rw=1, context=2
