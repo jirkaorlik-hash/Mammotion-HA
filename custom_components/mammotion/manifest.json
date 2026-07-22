@@ -29,6 +29,6 @@
   ],
   "iot_class": "local_push",
   "requirements": [
-    "pymammotion @ git+https://github.com/jirkaorlik-hash/PyMammotion.git@5aa6de7872990261e4f3de9cf01107a8b7f12bd7"
+    "pymammotion @ git+https://github.com/jirkaorlik-hash/PyMammotion.git@f2578b35e21bf8ca87f466dd267633491b6444aa"
   ]
 }
