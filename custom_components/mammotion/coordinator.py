@@ -1103,16 +1103,69 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             await self.async_send_command(command_str, **kwargs)
         await self.async_get_reports(count=5)
 
+    def _fresh_report_recently_received(self, max_age_s: float = 90.0) -> bool:
+        """True if a cloud report arrived within *max_age_s* seconds.
+
+        A docked/idle Yuka pushes a full report unsolicited every ~12 s. While
+        those free pushes are arriving there is no value in *also* firing a
+        counted report poll — it just burns the 600-send / 12 h cloud quota.
+        """
+        handle = self.manager.mower(self.device_name)
+        if handle is None:
+            return False
+        tt = handle.cloud_transport()
+        if tt is None:
+            return False
+        transport = handle.get_transport(tt)
+        if transport is None or not hasattr(transport, "last_received_monotonic"):
+            return False
+        last = transport.last_received_monotonic
+        if not last:
+            return False
+        return (time.monotonic() - last) < max_age_s
+
+    def _device_in_active_mode(self) -> bool:
+        """True if sys_status is a genuinely active (mowing) mode."""
+        device = self.manager.get_device_by_name(self.device_name)
+        if device is None:
+            return False
+        return device.report_data.dev.sys_status in MOWING_ACTIVE_MODES
+
+    def _skip_idle_report_poll(self, what: str) -> bool:
+        """Suppress a counted report poll when it would be pure quota waste.
+
+        Only counted sends issued while the mower is *not* actively mowing are
+        suppressed, and only while the device's own free report stream is still
+        delivering. During a real mow (active mode) every request is allowed
+        through so live telemetry is never starved.
+        """
+        if self._device_in_active_mode():
+            return False
+        if not self._fresh_report_recently_received():
+            return False
+        LOGGER.debug(
+            "report-coordinator [%s]: skipping idle %s — free report stream is live",
+            self.device_name,
+            what,
+        )
+        return True
+
     async def async_request_report_snapshot(self) -> None:
         """Fire a one-shot count=1 snapshot; no-op while BLE stream is active."""
+        if self._skip_idle_report_poll("snapshot"):
+            return
         await self.manager.request_report_snapshot(self.device_name)
 
     async def async_start_report_stream(self, duration_ms: int = 300_000) -> None:
         """Start a transient continuous report window via the library."""
+        if self._skip_idle_report_poll("report stream"):
+            return
         await self.manager.start_report_stream(self.device_name, duration_ms)
 
     async def async_get_reports(self, count: int = 5) -> None:
         """Get reports from the device."""
+        if self._skip_idle_report_poll("report batch"):
+            return
         await self.manager.request_reports(self.device_name, count=count)
 
     async def async_ensure_fresh_state(self) -> None:
